@@ -233,17 +233,22 @@ The watcher script (`scripts/preprocess.py`) does as much as possible in pure Py
 | Task | What Python does (0 tokens) | What Claude does |
 |------|-----------------------------|-----------------|
 | `memory` | Parse frontmatter, extract sources, count words, write all 3 memory files | Infer research question from content (optional) |
-| `compile` | Generate full LaTeX preamble, convert markdown structure, build BibTeX | Formalize informal language to academic register |
+| `compile` | Generate full LaTeX preamble, convert markdown structure, build BibTeX, remove contractions, cache unchanged chapters | Formalize informal language to academic register (via Haiku — fast and cheap) |
 | `check` | — | Fact-check claims + plagiarism search via WebSearch |
 | `qa` | Run `latexmk` compilation | Score quality, apply fixes |
 
-Running the full `/claude:all` pipeline costs approximately **8,000–18,000 tokens** per chapter. The naive approach (no preprocessing, loading all files every time) would cost 3–5× more.
+Running the full `/claude:all` pipeline costs approximately **5,000–12,000 tokens** per chapter. The naive approach (no preprocessing, loading all files every time) would cost 5–10x more.
 
-The watcher also:
-- **Debounces** saves (waits 2s after the last write event before processing)
-- **Locks** against concurrent Claude calls (one at a time)
-- **Tracks checksums** to detect when files actually changed
-- **Replaces triggers immediately** after detection, so a trigger never fires twice
+### Token-saving features
+
+- **Contraction pre-removal**: Python strips don't/can't/won't etc. before sending to Claude, reducing formalization work
+- **Chapter caching**: Unchanged chapters are cached by checksum and skip reprocessing entirely on subsequent runs
+- **Haiku for formalization**: The `compile` handler uses Claude Haiku (cheaper, faster) since it only needs to adjust register, not reason deeply
+- **Minimal prompts**: Claude receives only the body text — no memory files, no CLAUDE.md, no redundant instructions
+- **Frontmatter validation**: Invalid values (e.g. `font_size: 14pt`) are caught and fixed by Python before reaching Claude
+- **Debounce + lock**: Prevents wasted duplicate calls on rapid saves
+- **Log rotation**: Watcher log auto-rotates at 5 MB
+- **Stale marker cleanup**: If the watcher crashes, `<!-- processing... -->` markers are cleaned on restart
 
 ---
 

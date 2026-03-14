@@ -3,18 +3,21 @@
 preprocess.py — Zero-token preprocessor for the thesis watcher.
 
 Handles all deterministic work before any Claude API call:
-  - Parse YAML frontmatter
+  - Parse YAML frontmatter (with validation)
   - Strip "Note to self" lines
+  - Remove common contractions (don't→do not, etc.)
   - Extract ## Sources section → BibTeX
   - Convert @citekey → LaTeX citation commands
   - Convert markdown structure → LaTeX structure
   - Generate full LaTeX preamble from frontmatter
   - Update memory files (thesis-context.md, sources.md, progress.md)
   - Check for broken citekeys
+  - Cache unchanged chapters via checksums
 
 Usage:
-  python3 scripts/preprocess.py <notes-file> [--trigger COMMAND] [--all-files]
+  python3 scripts/preprocess.py <notes-file> [--trigger COMMAND]
   python3 scripts/preprocess.py --checksums-only <notes-file>
+  python3 scripts/preprocess.py --compile-all
 
 Outputs JSON to stdout. Writes memory files as side effects.
 """
@@ -28,6 +31,139 @@ import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+
+# ─── Contraction removal (zero-token work, saves Claude effort) ──────────
+
+CONTRACTIONS = {
+    r"\bdon't\b": "do not",
+    r"\bdon't\b": "do not",
+    r"\bcan't\b": "cannot",
+    r"\bcan't\b": "cannot",
+    r"\bwon't\b": "will not",
+    r"\bwon't\b": "will not",
+    r"\bshouldn't\b": "should not",
+    r"\bshouldn't\b": "should not",
+    r"\bcouldn't\b": "could not",
+    r"\bcouldn't\b": "could not",
+    r"\bwouldn't\b": "would not",
+    r"\bwouldn't\b": "would not",
+    r"\bisn't\b": "is not",
+    r"\bisn't\b": "is not",
+    r"\baren't\b": "are not",
+    r"\baren't\b": "are not",
+    r"\bwasn't\b": "was not",
+    r"\bwasn't\b": "was not",
+    r"\bweren't\b": "were not",
+    r"\bweren't\b": "were not",
+    r"\bhasn't\b": "has not",
+    r"\bhasn't\b": "has not",
+    r"\bhaven't\b": "have not",
+    r"\bhaven't\b": "have not",
+    r"\bhadn't\b": "had not",
+    r"\bhadn't\b": "had not",
+    r"\bdoesn't\b": "does not",
+    r"\bdoesn't\b": "does not",
+    r"\bdidn't\b": "did not",
+    r"\bdidn't\b": "did not",
+    r"\blet's\b": "let us",
+    r"\blet's\b": "let us",
+    r"\bthat's\b": "that is",
+    r"\bthat's\b": "that is",
+    r"\bthere's\b": "there is",
+    r"\bthere's\b": "there is",
+    r"\bhere's\b": "here is",
+    r"\bhere's\b": "here is",
+    r"\bwhat's\b": "what is",
+    r"\bwhat's\b": "what is",
+    r"\bwho's\b": "who is",
+    r"\bwho's\b": "who is",
+    r"\bI'm\b": "I am",
+    r"\bI'm\b": "I am",
+    r"\bI've\b": "I have",
+    r"\bI've\b": "I have",
+    r"\bI'll\b": "I will",
+    r"\bI'll\b": "I will",
+    r"\bI'd\b": "I would",
+    r"\bI'd\b": "I would",
+    r"\bit's\b": "it is",
+    r"\bit's\b": "it is",
+    r"\bwe're\b": "we are",
+    r"\bwe're\b": "we are",
+    r"\bthey're\b": "they are",
+    r"\bthey're\b": "they are",
+    r"\byou're\b": "you are",
+    r"\byou're\b": "you are",
+    r"\bwe've\b": "we have",
+    r"\bwe've\b": "we have",
+    r"\bthey've\b": "they have",
+    r"\bthey've\b": "they have",
+    r"\bwe'll\b": "we will",
+    r"\bwe'll\b": "we will",
+    r"\bthey'll\b": "they will",
+    r"\bthey'll\b": "they will",
+}
+
+def remove_contractions(text: str) -> str:
+    """Pre-remove English contractions. Handles both straight and curly apostrophes."""
+    for pattern, replacement in CONTRACTIONS.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+# ─── Frontmatter validation ──────────────────────────────────────────────
+
+VALID_FONT_SIZES = {"10pt", "11pt", "12pt"}
+VALID_CITATION_STYLES = {"apa", "chicago", "ieee", "mla", "harvard", "vancouver"}
+VALID_LANGUAGES = {
+    "english", "german", "ngerman", "french", "spanish", "italian",
+    "portuguese", "dutch", "polish", "russian", "chinese", "japanese",
+    "british", "american", "australian", "canadian",
+}
+
+def validate_frontmatter(fm: dict) -> list[str]:
+    """Returns a list of warning strings for invalid frontmatter values."""
+    warnings = []
+
+    if "font_size" in fm and fm["font_size"] not in VALID_FONT_SIZES:
+        warnings.append(
+            f"font_size '{fm['font_size']}' is not standard LaTeX. "
+            f"Valid: {', '.join(sorted(VALID_FONT_SIZES))}. Defaulting to 12pt."
+        )
+        fm["font_size"] = "12pt"
+
+    if "line_spacing" in fm:
+        try:
+            val = float(fm["line_spacing"])
+            if not (0.5 <= val <= 3.0):
+                warnings.append(f"line_spacing {val} is out of range [0.5, 3.0]. Using 1.5.")
+                fm["line_spacing"] = "1.5"
+        except ValueError:
+            warnings.append(f"line_spacing '{fm['line_spacing']}' is not a number. Using 1.5.")
+            fm["line_spacing"] = "1.5"
+
+    if "citation_style" in fm:
+        style = fm["citation_style"].lower()
+        if style not in VALID_CITATION_STYLES:
+            warnings.append(
+                f"citation_style '{fm['citation_style']}' is not recognized. "
+                f"Valid: {', '.join(sorted(VALID_CITATION_STYLES))}. Defaulting to APA."
+            )
+            fm["citation_style"] = "APA"
+
+    if "language" in fm:
+        lang = fm["language"].lower()
+        if lang not in VALID_LANGUAGES:
+            warnings.append(
+                f"language '{fm['language']}' may not be a valid babel language. "
+                f"Common: english, german, french, spanish."
+            )
+
+    if "margin" in fm:
+        m = re.match(r"^[\d.]+\s*(cm|mm|in|pt|em)$", fm["margin"])
+        if not m:
+            warnings.append(f"margin '{fm['margin']}' looks invalid. Expected e.g. '2.5cm'. Using 2.5cm.")
+            fm["margin"] = "2.5cm"
+
+    return warnings
 
 # ─── YAML frontmatter parser ───────────────────────────────────────────────
 
@@ -53,7 +189,6 @@ def parse_sources_section(body: str) -> tuple[list[dict], str]:
     """
     Finds '## Sources' heading and parses entries below it.
     Returns (sources_list, body_without_sources_section).
-    Entry format: "- citekey: Author(s), "Title", Venue, Year"
     """
     sources_match = re.search(r"\n## Sources\s*\n", body)
     if not sources_match:
@@ -67,7 +202,6 @@ def parse_sources_section(body: str) -> tuple[list[dict], str]:
     in_sources = True
 
     for line in sources_text.splitlines():
-        # A new ## heading ends the sources section
         if line.startswith("## ") or line.startswith("# "):
             in_sources = False
         if not in_sources:
@@ -87,15 +221,27 @@ def parse_sources_section(body: str) -> tuple[list[dict], str]:
 
 # ─── BibTeX generation ─────────────────────────────────────────────────────
 
+def escape_bibtex(text: str) -> str:
+    """Escape special LaTeX/BibTeX characters in user-provided text."""
+    # Protect existing braces, then escape special chars
+    replacements = [
+        ("&", r"\&"),
+        ("%", r"\%"),
+        ("#", r"\#"),
+        ("_", r"\_"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
 def source_to_bibtex(source: dict) -> str:
     """
     Converts a parsed source dict to a BibTeX entry.
-    Heuristic type detection: article / book / inproceedings / misc
+    Heuristic type detection: article / book / inproceedings / misc.
     """
     citekey = source["citekey"]
     raw = source["raw"]
 
-    # Detect entry type from venue keywords
     entry_type = "misc"
     raw_lower = raw.lower()
     if any(k in raw_lower for k in ["journal", "review", "letters", "nature ", "science ", "ieee trans"]):
@@ -105,8 +251,6 @@ def source_to_bibtex(source: dict) -> str:
     elif any(k in raw_lower for k in ["press", "publisher", "edition", "book"]):
         entry_type = "book"
 
-    # Try to parse: Author(s), "Title", Venue, Year
-    # Pattern: anything, "quoted title", venue, year
     year = ""
     year_m = re.search(r"\b(19|20)\d{2}\b", raw)
     if year_m:
@@ -114,64 +258,51 @@ def source_to_bibtex(source: dict) -> str:
 
     title = ""
     title_m = re.search(r'"([^"]+)"', raw)
+    if not title_m:
+        title_m = re.search(r'\u201c([^\u201d]+)\u201d', raw)
     if title_m:
         title = title_m.group(1)
 
-    # Authors: everything before the first comma+space+"  or the title
     authors_part = raw.split(',"')[0].split(',"')[0].strip().rstrip(",").strip()
     if title_m:
         authors_part = raw[:title_m.start()].strip().rstrip(",").strip()
 
-    # Venue: between title and year
     venue = ""
-    if title_m and year:
+    if title_m and year_m:
         between = raw[title_m.end():year_m.start()].strip().strip(",").strip()
         venue = between
 
-    if entry_type == "article":
-        return (f"@article{{{citekey},\n"
-                f"  author  = {{{authors_part}}},\n"
-                f"  title   = {{{title or raw}}},\n"
-                f"  journal = {{{venue or 'UNKNOWN'}}},\n"
-                f"  year    = {{{year or 'XXXX'}}},\n}}")
-    elif entry_type == "inproceedings":
-        return (f"@inproceedings{{{citekey},\n"
-                f"  author    = {{{authors_part}}},\n"
-                f"  title     = {{{title or raw}}},\n"
-                f"  booktitle = {{{venue or 'UNKNOWN'}}},\n"
-                f"  year      = {{{year or 'XXXX'}}},\n}}")
-    elif entry_type == "book":
-        return (f"@book{{{citekey},\n"
-                f"  author    = {{{authors_part}}},\n"
-                f"  title     = {{{title or raw}}},\n"
-                f"  publisher = {{{venue or 'UNKNOWN'}}},\n"
-                f"  year      = {{{year or 'XXXX'}}},\n}}")
-    else:
-        return (f"@misc{{{citekey},\n"
-                f"  author = {{{authors_part}}},\n"
-                f"  title  = {{{title or raw}}},\n"
-                f"  year   = {{{year or 'XXXX'}}},\n"
-                f"  note   = {{{venue}}},\n}}")
+    # Escape special characters
+    authors_part = escape_bibtex(authors_part)
+    title = escape_bibtex(title or raw)
+    venue = escape_bibtex(venue)
+
+    venue_field = {
+        "article": "journal",
+        "inproceedings": "booktitle",
+        "book": "publisher",
+    }.get(entry_type, "note")
+
+    return (f"@{entry_type}{{{citekey},\n"
+            f"  author = {{{authors_part}}},\n"
+            f"  title  = {{{title}}},\n"
+            f"  {venue_field} = {{{venue or 'UNKNOWN'}}},\n"
+            f"  year   = {{{year or 'XXXX'}}},\n}}")
 
 def update_bib_file(sources: list[dict]) -> None:
-    """Appends new BibTeX entries to refs.bib; skips existing citekeys."""
+    """Writes all BibTeX entries to refs.bib, rebuilding from source list."""
     bib_path = PROJECT_ROOT / "thesis" / "bibliography" / "refs.bib"
     bib_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_keys = set()
-    if bib_path.exists():
-        content = bib_path.read_text()
-        existing_keys = set(re.findall(r"@\w+\{(\S+?),", content))
-
-    new_entries = []
+    # Full rebuild from sources to avoid append-based dedup bugs
+    seen_keys = set()
+    entries = []
     for src in sources:
-        if src["citekey"] not in existing_keys:
-            new_entries.append(source_to_bibtex(src))
-            existing_keys.add(src["citekey"])
+        if src["citekey"] not in seen_keys:
+            entries.append(source_to_bibtex(src))
+            seen_keys.add(src["citekey"])
 
-    if new_entries:
-        with open(bib_path, "a") as f:
-            f.write("\n" + "\n\n".join(new_entries) + "\n")
+    bib_path.write_text("\n\n".join(entries) + "\n" if entries else "")
 
 # ─── Note stripping ────────────────────────────────────────────────────────
 
@@ -187,8 +318,10 @@ STYLE_TO_CMD = {
     "apa": r"\parencite",
     "chicago": r"\parencite",
     "chicago-authordate": r"\parencite",
+    "harvard": r"\parencite",
     "ieee": r"\cite",
     "mla": r"\cite",
+    "vancouver": r"\cite",
 }
 
 def convert_citations(body: str, citation_style: str) -> str:
@@ -202,6 +335,14 @@ def find_broken_citekeys(body: str, sources: list[dict]) -> list[str]:
     in_text = set(re.findall(r"@(\w+)", body))
     defined = {s["citekey"] for s in sources}
     return sorted(in_text - defined)
+
+# ─── Word count (single implementation) ──────────────────────────────────
+
+def count_body_words(body: str) -> int:
+    """Count words in body text, excluding headings and blank lines."""
+    word_lines = [l for l in body.splitlines()
+                  if l.strip() and not l.startswith("#")]
+    return sum(len(l.split()) for l in word_lines)
 
 # ─── Markdown → LaTeX structural conversion ───────────────────────────────
 
@@ -242,7 +383,7 @@ def md_to_latex_body(md: str) -> str:
             out.append(r"\end{enumerate}")
             in_enumerate = False
 
-        # Headings
+        # Headings (check longest first to avoid false matches)
         h4 = re.match(r"^####\s+(.*)", line)
         h3 = re.match(r"^###\s+(.*)", line)
         h2 = re.match(r"^##\s+(.*)", line)
@@ -278,7 +419,7 @@ def md_to_latex_body(md: str) -> str:
             out.append(f"  \\item {item_text}")
             continue
 
-        # Blockquote (non-personal-note)
+        # Blockquote (non-personal-note — those were already stripped)
         bq = re.match(r"^>\s+(.*)", line)
         if bq:
             out.append(f"\\begin{{quote}}\n{inline_md_to_latex(bq.group(1))}\n\\end{{quote}}")
@@ -306,13 +447,27 @@ def md_to_latex_body(md: str) -> str:
     return "\n".join(out)
 
 def inline_md_to_latex(text: str) -> str:
-    """Convert inline markdown (bold, italic, code) to LaTeX."""
-    # Bold before italic (greedy issue otherwise)
+    """Convert inline markdown (bold, italic, code) to LaTeX.
+    Handles nested formatting: **bold with *italic* inside** works correctly
+    because we process bold first (greedy for outer), then italic on the inner."""
+    # Inline code first (protect from bold/italic processing)
+    code_parts = []
+    def save_code(m):
+        code_parts.append(m.group(1))
+        return f"\x00CODE{len(code_parts)-1}\x00"
+    text = re.sub(r"`(.+?)`", save_code, text)
+
+    # Bold (** and __)
     text = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", text)
     text = re.sub(r"__(.+?)__", r"\\textbf{\1}", text)
+    # Italic (* and _) — only match if not preceded/followed by word chars for _
     text = re.sub(r"\*(.+?)\*", r"\\textit{\1}", text)
-    text = re.sub(r"_(.+?)_", r"\\textit{\1}", text)
-    text = re.sub(r"`(.+?)`", r"\\texttt{\1}", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\\textit{\1}", text)
+
+    # Restore code
+    for i, code in enumerate(code_parts):
+        text = text.replace(f"\x00CODE{i}\x00", f"\\texttt{{{code}}}")
+
     return text
 
 # ─── LaTeX preamble generator ──────────────────────────────────────────────
@@ -320,8 +475,10 @@ def inline_md_to_latex(text: str) -> str:
 STYLE_MAP = {
     "apa": "apa",
     "chicago": "chicago-authordate",
+    "harvard": "authoryear",
     "ieee": "ieee",
     "mla": "mla",
+    "vancouver": "numeric",
 }
 
 def generate_preamble(fm: dict) -> str:
@@ -457,15 +614,11 @@ def update_progress(notes_files: list[Path]) -> None:
     for nf in sorted(notes_files):
         text = nf.read_text()
         _, body = parse_frontmatter(text)
-        sources, clean_body = parse_sources_section(body)
+        _, clean_body = parse_sources_section(body)
         clean_body = strip_personal_notes(clean_body)
-        # Strip headings and blank lines for word count
-        word_lines = [l for l in clean_body.splitlines()
-                      if l.strip() and not l.startswith("#")]
-        words = sum(len(l.split()) for l in word_lines)
+        words = count_body_words(clean_body)
         total_words += words
 
-        # Get chapter title from first # heading
         title_m = re.search(r"^#\s+(.+)", clean_body, re.MULTILINE)
         chapter_title = title_m.group(1) if title_m else nf.stem
 
@@ -514,50 +667,193 @@ def save_checksums(state_dir: Path, checksums: dict) -> None:
     content = "\n".join(f"{v}  {k}" for k, v in sorted(checksums.items()))
     (state_dir / "checksums.md5").write_text(content + "\n")
 
+# ─── Chapter cache ────────────────────────────────────────────────────────
+
+def load_chapter_cache(state_dir: Path) -> dict:
+    """Load cached LaTeX bodies keyed by file checksum."""
+    cache_file = state_dir / "chapter_cache.json"
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def save_chapter_cache(state_dir: Path, cache: dict) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "chapter_cache.json").write_text(json.dumps(cache))
+
+# ─── Compile all chapters ────────────────────────────────────────────────
+
+def compile_all_chapters(state_dir: Path) -> dict:
+    """
+    Process ALL notes files and return combined result.
+    Uses chapter cache to skip unchanged files.
+    Returns the same JSON structure as single-file mode but with all chapters combined.
+    """
+    notes_dir = PROJECT_ROOT / "thesis" / "notes"
+    all_notes = sorted(notes_dir.glob("*.md"))
+
+    if not all_notes:
+        return {"error": "No notes files found in thesis/notes/"}
+
+    checksums = load_checksums(state_dir)
+    chapter_cache = load_chapter_cache(state_dir)
+
+    # Merge frontmatter from all files
+    merged_fm = {}
+    for nf in all_notes:
+        nf_fm, _ = parse_frontmatter(nf.read_text())
+        for k, v in nf_fm.items():
+            if k not in merged_fm:
+                merged_fm[k] = v
+
+    # Validate
+    fm_warnings = validate_frontmatter(merged_fm)
+
+    # Collect all sources
+    all_sources = []
+    seen_keys = set()
+    for nf in all_notes:
+        _, nf_body = parse_frontmatter(nf.read_text())
+        srcs, _ = parse_sources_section(nf_body)
+        for s in srcs:
+            if s["citekey"] not in seen_keys:
+                all_sources.append(s)
+                seen_keys.add(s["citekey"])
+
+    # Process each chapter, using cache for unchanged ones
+    combined_latex_body = []
+    combined_body_text = []
+    all_broken = []
+    total_words = 0
+    chapters_cached = 0
+    chapters_processed = 0
+
+    for nf in all_notes:
+        ck = file_checksum(nf)
+        cache_key = f"{nf.name}:{ck}"
+
+        if cache_key in chapter_cache:
+            # Use cached LaTeX body
+            cached = chapter_cache[cache_key]
+            combined_latex_body.append(cached["latex_body"])
+            combined_body_text.append(cached["body_text"])
+            total_words += cached["word_count"]
+            chapters_cached += 1
+        else:
+            # Process this chapter
+            raw = nf.read_text()
+            fm, body = parse_frontmatter(raw)
+            sources_this, body_no_sources = parse_sources_section(body)
+            body_clean = strip_personal_notes(body_no_sources)
+            body_clean = remove_contractions(body_clean)
+            words = count_body_words(body_clean)
+            total_words += words
+
+            citation_style = merged_fm.get("citation_style", "APA")
+            body_cited = convert_citations(body_clean, citation_style)
+            broken = find_broken_citekeys(body_clean, all_sources)
+            all_broken.extend(broken)
+
+            latex_body = md_to_latex_body(body_cited)
+
+            # Cache this chapter
+            chapter_cache[cache_key] = {
+                "latex_body": latex_body,
+                "body_text": body_clean,
+                "word_count": words,
+            }
+            combined_latex_body.append(latex_body)
+            combined_body_text.append(body_clean)
+            chapters_processed += 1
+
+        # Update checksum
+        checksums[str(nf)] = file_checksum(nf)
+
+    save_checksums(state_dir, checksums)
+    save_chapter_cache(state_dir, chapter_cache)
+
+    # Update bib + memory
+    update_bib_file(all_sources)
+    update_thesis_context(merged_fm)
+    update_sources_memory(all_sources)
+    update_progress(all_notes)
+
+    return {
+        "file": "thesis/notes/ (all)",
+        "trigger": "compile",
+        "frontmatter": merged_fm,
+        "body_text": "\n\n".join(combined_body_text),
+        "latex_preamble": generate_preamble(merged_fm),
+        "latex_body": "\n\n".join(combined_latex_body),
+        "latex_suffix": generate_suffix(),
+        "broken_citekeys": sorted(set(all_broken)),
+        "word_count": total_words,
+        "sources_count": len(all_sources),
+        "changed": chapters_processed > 0,
+        "chapters_cached": chapters_cached,
+        "chapters_processed": chapters_processed,
+        "warnings": fm_warnings,
+    }
+
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
     if not args:
-        print(json.dumps({"error": "No arguments provided"}))
+        print(json.dumps({"error": "Usage: preprocess.py <file> [--trigger CMD] | --checksums-only <file> | --compile-all"}))
         sys.exit(1)
 
     state_dir = PROJECT_ROOT / "scripts" / ".watcher-state"
 
-    # Checksums-only mode: just update checksums, no output
+    # Checksums-only mode
     if "--checksums-only" in args:
         target = Path(args[-1])
         if not target.is_absolute():
             target = PROJECT_ROOT / target
-        checksums = load_checksums(state_dir)
-        checksums[str(target)] = file_checksum(target)
-        save_checksums(state_dir, checksums)
+        if target.exists():
+            checksums = load_checksums(state_dir)
+            checksums[str(target)] = file_checksum(target)
+            save_checksums(state_dir, checksums)
         return
 
-    # Normal mode
+    # Compile-all mode: process every notes file with caching
+    if "--compile-all" in args:
+        result = compile_all_chapters(state_dir)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    # Normal single-file mode
     trigger = None
     if "--trigger" in args:
         idx = args.index("--trigger")
         trigger = args[idx + 1]
         args = [a for i, a in enumerate(args) if i not in (idx, idx + 1)]
 
-    all_files_mode = "--all-files" in args
-    args = [a for a in args if a != "--all-files"]
-
     target_file = Path(args[0])
     if not target_file.is_absolute():
         target_file = PROJECT_ROOT / target_file
 
-    # Collect all notes files for memory updates
     notes_dir = PROJECT_ROOT / "thesis" / "notes"
     all_notes = sorted(notes_dir.glob("*.md"))
 
-    # Read target file
     if not target_file.exists():
-        print(json.dumps({"error": f"File not found: {target_file}"}))
+        print(json.dumps({"error": f"File not found: {target_file}. Place your .md files in thesis/notes/"}))
         sys.exit(1)
 
     raw = target_file.read_text()
+
+    # Empty file guard
+    fm, body = parse_frontmatter(raw)
+    body_stripped = body.strip()
+    if not body_stripped:
+        print(json.dumps({
+            "error": "empty_body",
+            "message": f"File {target_file.name} has no body text (only frontmatter or whitespace).",
+            "file": target_file.name,
+        }))
+        sys.exit(0)  # Not a crash — just nothing to process
 
     # Check if file actually changed
     checksums = load_checksums(state_dir)
@@ -566,10 +862,7 @@ def main():
     checksums[str(target_file)] = current_ck
     save_checksums(state_dir, checksums)
 
-    # Parse
-    fm, body = parse_frontmatter(raw)
-
-    # Collect frontmatter from all files (first file with a key wins)
+    # Merge frontmatter from all notes files
     merged_fm = {}
     for nf in all_notes:
         nf_fm, _ = parse_frontmatter(nf.read_text())
@@ -578,7 +871,10 @@ def main():
                 merged_fm[k] = v
     merged_fm.update({k: v for k, v in fm.items() if v})  # current file overrides
 
-    # Extract sources from ALL notes files
+    # Validate frontmatter
+    fm_warnings = validate_frontmatter(merged_fm)
+
+    # Collect all sources from all notes
     all_sources = []
     seen_keys = set()
     for nf in all_notes:
@@ -590,32 +886,32 @@ def main():
                 all_sources.append(s)
                 seen_keys.add(s["citekey"])
 
+    # Also include sources from target file if it's not in notes/
+    if target_file.parent != notes_dir:
+        target_srcs, _ = parse_sources_section(body)
+        for s in target_srcs:
+            if s["citekey"] not in seen_keys:
+                all_sources.append(s)
+                seen_keys.add(s["citekey"])
+
     # Process target file body
-    sources_this_file, body_no_sources = parse_sources_section(body)
+    _, body_no_sources = parse_sources_section(body)
     body_no_notes = strip_personal_notes(body_no_sources)
+    body_no_notes = remove_contractions(body_no_notes)
 
     citation_style = merged_fm.get("citation_style", "APA")
     body_citations_converted = convert_citations(body_no_notes, citation_style)
     broken_keys = find_broken_citekeys(body_no_notes, all_sources)
 
-    # Convert markdown structure to LaTeX (NOT language formalized)
     latex_body = md_to_latex_body(body_citations_converted)
-
-    # Generate preamble
     latex_preamble = generate_preamble(merged_fm)
 
-    # Update BibTeX file
     update_bib_file(all_sources)
-
-    # Update memory files
     update_thesis_context(merged_fm)
     update_sources_memory(all_sources)
     update_progress(all_notes)
 
-    # Word count (body only, no headings/blank lines)
-    word_lines = [l for l in body_no_notes.splitlines()
-                  if l.strip() and not l.startswith("#")]
-    word_count = sum(len(l.split()) for l in word_lines)
+    word_count = count_body_words(body_no_notes)
 
     result = {
         "file": str(target_file.relative_to(PROJECT_ROOT)),
@@ -629,6 +925,7 @@ def main():
         "word_count": word_count,
         "sources_count": len(all_sources),
         "changed": changed,
+        "warnings": fm_warnings,
     }
 
     print(json.dumps(result, ensure_ascii=False))

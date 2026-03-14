@@ -4,7 +4,7 @@
 # Watches thesis/notes/ for saves. When a /claude:COMMAND trigger is found
 # in a notes file, it:
 #   1. Runs preprocess.py (zero tokens) to handle all deterministic work
-#   2. Calls `claude -p` with a minimal, targeted prompt for AI-only tasks
+#   2. Calls `claude --print` with a minimal, targeted prompt for AI-only tasks
 #
 # Usage: ./scripts/watcher.sh (or use start-watcher.sh to run in background)
 #
@@ -26,6 +26,7 @@ STATE_DIR="$SCRIPT_DIR/.watcher-state"
 LOCK_FILE="$STATE_DIR/claude.lock"
 LOG_FILE="$STATE_DIR/watcher.log"
 PREPROCESS="$SCRIPT_DIR/preprocess.py"
+MAX_LOG_BYTES=5242880  # 5 MB
 
 # ─── Prerequisites ────────────────────────────────────────────────────────
 check_deps() {
@@ -53,6 +54,16 @@ log() {
     echo "$msg" >> "$LOG_FILE"
 }
 
+rotate_log() {
+    if [ -f "$LOG_FILE" ]; then
+        log_size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt "$MAX_LOG_BYTES" ]; then
+            mv "$LOG_FILE" "$LOG_FILE.old"
+            log "Log rotated (previous log: $LOG_FILE.old)"
+        fi
+    fi
+}
+
 # ─── Lock helpers ─────────────────────────────────────────────────────────
 acquire_lock() {
     if [ -f "$LOCK_FILE" ]; then
@@ -72,8 +83,6 @@ release_lock() {
 }
 
 # ─── Trigger detection ────────────────────────────────────────────────────
-# Returns the command name from the first /claude:CMD line in the file,
-# or empty string if none found.
 find_trigger() {
     file="$1"
     grep -m1 -oP '(?<=/claude:)\w+' "$file" 2>/dev/null || echo ""
@@ -83,7 +92,6 @@ find_trigger() {
 mark_processing() {
     file="$1"
     cmd="$2"
-    # Use python3 for safe in-place replacement (sed -i varies across systems)
     python3 - "$file" "$cmd" <<'PYEOF'
 import sys, re
 path, cmd = sys.argv[1], sys.argv[2]
@@ -109,207 +117,265 @@ path, cmd, ts, note = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(path).read()
 text = re.sub(
     rf'<!-- claude:{re.escape(cmd)} processing\.\.\. -->',
-    f'<!-- claude:{cmd} ✓ {ts} | {note} -->',
+    f'<!-- claude:{cmd} done {ts} | {note} -->',
     text, count=1
 )
 open(path, 'w').write(text)
 PYEOF
 }
 
+# Clean up stale "processing..." markers (e.g. after a crash).
+cleanup_stale_markers() {
+    for f in "$NOTES_DIR"/*.md; do
+        [ -f "$f" ] || continue
+        if grep -q '<!-- claude:\w\+ processing\.\.\. -->' "$f" 2>/dev/null; then
+            log "Cleaning stale processing marker in $(basename "$f")"
+            python3 - "$f" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+text = open(path).read()
+text = re.sub(
+    r'<!-- claude:(\w+) processing\.\.\. -->',
+    r'<!-- claude:\1 stale (watcher restarted) -->',
+    text
+)
+open(path, 'w').write(text)
+PYEOF
+        fi
+    done
+}
+
+# ─── JSON field extractor (parse once, extract many) ─────────────────────
+# Usage: extract_json "$json_string" field1 field2 ...
+# Sets variables: _field1, _field2, etc.
+extract_json() {
+    _json="$1"
+    shift
+    eval "$(echo "$_json" | python3 -c "
+import sys, json
+fields = sys.argv[1:]
+try:
+    d = json.load(sys.stdin)
+    for f in fields:
+        val = d.get(f, '')
+        if isinstance(val, list):
+            val = ', '.join(str(x) for x in val) if val else 'none'
+        elif isinstance(val, bool):
+            val = 'true' if val else 'false'
+        elif isinstance(val, dict):
+            val = json.dumps(val)
+        # Shell-safe: replace single quotes and newlines
+        val = str(val)
+        print(f'_{f}={chr(39)}{val}{chr(39)}')
+except Exception as e:
+    print(f'_error={chr(39)}{e}{chr(39)}')
+" "$@")"
+}
+
 # ─── Handler: memory ─────────────────────────────────────────────────────
-# preprocess.py already wrote all memory files.
-# Only calls Claude if research question needs to be inferred.
+# preprocess.py already writes all memory files. Zero tokens.
 handle_memory() {
     file="$1"
+    _skip_mark="$2"  # "skip" if called from handle_all
+
     log "  [memory] Running preprocess.py..."
     ctx=$(python3 "$PREPROCESS" "$file" --trigger memory 2>&1)
-    if echo "$ctx" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('sources_count',0) >= 0 else 1)" 2>/dev/null; then
-        wc=$(echo "$ctx" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('word_count',0))")
-        sc=$(echo "$ctx" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sources_count',0))")
-        log "  [memory] Memory files updated. Words: $wc, Sources: $sc (0 tokens used)"
-        mark_done "$file" "memory" "memory files updated (${sc} sources, ~${wc} words)"
-    else
-        log "  [memory] ERROR: preprocess.py failed: $ctx"
-        mark_done "$file" "memory" "ERROR — check watcher.log"
+
+    extract_json "$ctx" word_count sources_count error warnings
+    if [ -n "$_error" ] && [ "$_error" != "" ]; then
+        log "  [memory] ERROR: $_error"
+        [ "$_skip_mark" != "skip" ] && mark_done "$file" "memory" "ERROR — check watcher.log"
+        return 1
     fi
+
+    if [ -n "$_warnings" ] && [ "$_warnings" != "none" ] && [ "$_warnings" != "" ]; then
+        log "  [memory] Warnings: $_warnings"
+    fi
+
+    log "  [memory] Memory files updated. Words: $_word_count, Sources: $_sources_count (0 tokens)"
+    [ "$_skip_mark" != "skip" ] && mark_done "$file" "memory" "updated (${_sources_count} sources, ~${_word_count} words)"
+    return 0
 }
 
 # ─── Handler: compile ────────────────────────────────────────────────────
-# preprocess.py generates the LaTeX structure. Claude only formalizes language.
-# After Claude returns, watcher assembles and writes main.tex, then runs latexmk.
 handle_compile() {
     file="$1"
-    log "  [compile] Running preprocess.py..."
-    ctx=$(python3 "$PREPROCESS" "$file" --trigger compile 2>&1)
+    _skip_mark="$2"
 
-    if ! echo "$ctx" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-        log "  [compile] ERROR: preprocess.py failed: $ctx"
-        mark_done "$file" "compile" "ERROR in preprocess — check watcher.log"
-        return
+    log "  [compile] Running preprocess.py (all chapters)..."
+    ctx=$(python3 "$PREPROCESS" --compile-all 2>&1)
+
+    extract_json "$ctx" latex_preamble latex_body latex_suffix broken_citekeys \
+                        word_count changed chapters_cached chapters_processed error warnings
+
+    if [ -n "$_error" ] && [ "$_error" != "" ]; then
+        log "  [compile] ERROR: $_error"
+        [ "$_skip_mark" != "skip" ] && mark_done "$file" "compile" "ERROR — $_error"
+        return 1
     fi
 
-    preamble=$(echo "$ctx" | python3 -c "import sys,json; print(json.load(sys.stdin)['latex_preamble'])")
-    latex_body=$(echo "$ctx" | python3 -c "import sys,json; print(json.load(sys.stdin)['latex_body'])")
-    suffix=$(echo "$ctx" | python3 -c "import sys,json; print(json.load(sys.stdin)['latex_suffix'])")
-    broken=$(echo "$ctx" | python3 -c "import sys,json; d=json.load(sys.stdin); print(', '.join(d['broken_citekeys']) or 'none')")
+    if [ -n "$_warnings" ] && [ "$_warnings" != "none" ] && [ "$_warnings" != "" ]; then
+        log "  [compile] Frontmatter warnings: $_warnings"
+    fi
+
+    log "  [compile] Chapters: $_chapters_processed processed, $_chapters_cached cached"
+
+    # Warn about broken citekeys
+    if [ "$_broken_citekeys" != "none" ] && [ -n "$_broken_citekeys" ]; then
+        log "  [compile] WARNING: Unresolved @citekeys: $_broken_citekeys"
+    fi
 
     if [ "$CLAUDE_AVAILABLE" = "1" ]; then
-        log "  [compile] Calling Claude for language formalization..."
-        formalized=$(claude --print <<PROMPT
-You are an academic writing assistant. Formalize the following LaTeX body text to a formal, academic register: no contractions, no colloquialisms, third person where appropriate. Do NOT change LaTeX commands, citations (\\parencite{...} or \\cite{...}), or structural elements (\\chapter, \\section, etc.). Return ONLY the reformatted LaTeX body, nothing else — no explanation, no code fences.
+        log "  [compile] Calling Claude (haiku) for language formalization..."
+        formalized=$(claude --print --model haiku <<PROMPT
+Formalize this LaTeX body to academic register. No contractions, no colloquialisms, third person. Keep all LaTeX commands, \\parencite{}, \\cite{}, \\chapter{}, etc. unchanged. Return ONLY the LaTeX body — no explanation, no code fences.
 
-$latex_body
+$_latex_body
 PROMPT
 )
     else
         log "  [compile] Claude not available. Using unformalized body."
-        formalized="$latex_body"
+        formalized="$_latex_body"
     fi
 
     mkdir -p "$OUTPUT_DIR"
-    printf '%s\n%s\n%s' "$preamble" "$formalized" "$suffix" > "$OUTPUT_DIR/main.tex"
+    printf '%s\n%s\n%s' "$_latex_preamble" "$formalized" "$_latex_suffix" > "$OUTPUT_DIR/main.tex"
     log "  [compile] Written thesis/output/main.tex"
 
-    # Warn about broken citekeys
-    if [ "$broken" != "none" ]; then
-        log "  [compile] WARNING: Unresolved @citekeys: $broken"
+    # Attempt LaTeX compilation
+    compile_result="main.tex written"
+    if command -v latexmk >/dev/null 2>&1; then
+        log "  [compile] Running latexmk..."
+        if cd "$OUTPUT_DIR" && latexmk -xelatex -interaction=nonstopmode main.tex >/dev/null 2>&1; then
+            compile_result="main.tex + PDF generated"
+            log "  [compile] PDF compiled: thesis/output/main.pdf"
+        else
+            compile_result="main.tex written, LaTeX errors — see watcher.log"
+            log "  [compile] LaTeX compilation had errors"
+        fi
+        cd "$PROJECT_ROOT"
+    elif command -v xelatex >/dev/null 2>&1; then
+        log "  [compile] Running xelatex..."
+        if cd "$OUTPUT_DIR" && xelatex -interaction=nonstopmode main.tex >/dev/null 2>&1; then
+            compile_result="main.tex + PDF generated"
+        else
+            compile_result="main.tex written, LaTeX errors"
+        fi
+        cd "$PROJECT_ROOT"
+    else
+        log "  [compile] No LaTeX installed. Install: sudo pacman -S texlive-full"
+        compile_result="main.tex written (no LaTeX installed)"
     fi
 
-    # Attempt LaTeX compilation
-    if command -v latexmk >/dev/null 2>&1 || command -v xelatex >/dev/null 2>&1; then
-        log "  [compile] Running latexmk..."
-        result=$(cd "$OUTPUT_DIR" && latexmk -xelatex -interaction=nonstopmode main.tex 2>&1 | tail -5)
-        if [ $? -eq 0 ]; then
-            log "  [compile] PDF compiled successfully: thesis/output/main.pdf"
-            mark_done "$file" "compile" "main.tex + PDF generated"
-        else
-            log "  [compile] LaTeX errors: $result"
-            mark_done "$file" "compile" "main.tex written, LaTeX errors — see watcher.log"
-        fi
-    else
-        log "  [compile] LaTeX not installed. main.tex written. Install: sudo pacman -S texlive-full"
-        mark_done "$file" "compile" "main.tex written (no LaTeX installed)"
-    fi
+    [ "$_skip_mark" != "skip" ] && mark_done "$file" "compile" "$compile_result"
+    return 0
 }
 
 # ─── Handler: check ──────────────────────────────────────────────────────
-# Sends only the clean body text to Claude. No memory/frontmatter overhead.
 handle_check() {
     file="$1"
+    _skip_mark="$2"
+
     if [ "$CLAUDE_AVAILABLE" != "1" ]; then
         log "  [check] Claude not available. Skipping."
-        mark_done "$file" "check" "skipped — claude CLI not found"
-        return
+        [ "$_skip_mark" != "skip" ] && mark_done "$file" "check" "skipped — claude CLI not found"
+        return 1
     fi
 
     log "  [check] Extracting clean body..."
-    body=$(python3 "$PREPROCESS" "$file" --trigger check 2>/dev/null | \
-           python3 -c "import sys,json; print(json.load(sys.stdin)['body_text'])")
+    ctx=$(python3 "$PREPROCESS" "$file" --trigger check 2>/dev/null)
+    extract_json "$ctx" body_text error
+
+    if [ -n "$_error" ] && [ "$_error" != "" ]; then
+        log "  [check] ERROR: $_error"
+        [ "$_skip_mark" != "skip" ] && mark_done "$file" "check" "ERROR — $_error"
+        return 1
+    fi
 
     log "  [check] Calling Claude for fact-check + plagiarism..."
     report=$(claude --print <<PROMPT
-Check the following thesis section for (1) factual accuracy and (2) plagiarism risk. Use WebSearch for both. Output a markdown report with exactly two sections:
+Fact-check and plagiarism-check this thesis section. Use WebSearch.
+Output markdown with two sections:
+## Fact Check (Score: 0-100, then issues list)
+## Plagiarism Risk (Score: 0-100, then risky phrases)
+No preamble. Issues only.
 
-## Fact Check
-Score: [0-100]
-[List each issue: claim → verdict (CONFIRMED/UNCONFIRMED/CONTRADICTED) → evidence]
-
-## Plagiarism Risk
-Score: [0-100]
-[List each risky phrase → match found or not → recommendation]
-
-Be concise. No preamble. Issues only — if a section is clean, write "No issues found."
-
---- THESIS SECTION ---
-$body
+$_body_text
 PROMPT
 )
 
     mkdir -p "$OUTPUT_DIR"
-    {
-        echo "# Check Report"
-        echo "Date: $(date '+%Y-%m-%d %H:%M')"
-        echo "File: $(basename "$file")"
-        echo ""
-        echo "$report"
-    } > "$OUTPUT_DIR/check-report.md"
+    printf '# Check Report\nDate: %s\nFile: %s\n\n%s\n' \
+        "$(date '+%Y-%m-%d %H:%M')" "$(basename "$file")" "$report" \
+        > "$OUTPUT_DIR/check-report.md"
 
-    # Append summary to feedback history
     echo "[$(date '+%Y-%m-%d')] check on $(basename "$file") — see thesis/output/check-report.md" \
         >> "$PROJECT_ROOT/memory/feedback-history.md"
 
-    log "  [check] Report written to thesis/output/check-report.md"
-    mark_done "$file" "check" "check-report.md written"
+    log "  [check] Report: thesis/output/check-report.md"
+    [ "$_skip_mark" != "skip" ] && mark_done "$file" "check" "check-report.md written"
+    return 0
 }
 
 # ─── Handler: qa ─────────────────────────────────────────────────────────
 handle_qa() {
     file="$1"
+    _skip_mark="$2"
     tex_file="$OUTPUT_DIR/main.tex"
 
     if [ ! -f "$tex_file" ]; then
         log "  [qa] thesis/output/main.tex not found. Run /claude:compile first."
-        mark_done "$file" "qa" "ERROR — compile first"
-        return
+        [ "$_skip_mark" != "skip" ] && mark_done "$file" "qa" "ERROR — compile first"
+        return 1
     fi
 
     # Run latexmk first (watcher handles compilation, not Claude)
     if command -v latexmk >/dev/null 2>&1; then
-        log "  [qa] Running latexmk before QA..."
+        log "  [qa] Pre-compiling with latexmk..."
         cd "$OUTPUT_DIR" && latexmk -xelatex -interaction=nonstopmode main.tex >/dev/null 2>&1 || true
         cd "$PROJECT_ROOT"
     fi
 
     if [ "$CLAUDE_AVAILABLE" != "1" ]; then
         log "  [qa] Claude not available. Skipping."
-        mark_done "$file" "qa" "skipped — claude CLI not found"
-        return
+        [ "$_skip_mark" != "skip" ] && mark_done "$file" "qa" "skipped — claude CLI not found"
+        return 1
     fi
 
     tex_content=$(cat "$tex_file")
     log "  [qa] Calling Claude for quality scoring..."
 
     result=$(claude --print <<PROMPT
-Score this LaTeX thesis document on four dimensions (0–25 each, total 100):
-1. Formatting — correct LaTeX structure, packages, spacing/margin/font per document settings
-2. Language Quality — formal academic register, no contractions, sentence clarity
-3. Structure — chapters have intro+conclusion paragraphs, logical flow, correct heading hierarchy
-4. Citation Compliance — every factual claim has a citation, all citekeys exist in the bibliography
-
-Apply ALL fixes you identify directly to the document. Return the complete corrected LaTeX.
-
-Then, after the LaTeX, output a summary block:
+Score this LaTeX thesis (0-25 each): Formatting, Language, Structure, Citations.
+Fix all issues in the document. Return the corrected LaTeX, then:
 SCORE:[total]/100
-FIXED:
-- [bullet list of what was fixed]
-REMAINING:
-- [bullet list of issues not auto-fixable]
+FIXED: [bullet list]
+REMAINING: [bullet list]
 
---- DOCUMENT ---
 $tex_content
 PROMPT
 )
 
-    # Extract SCORE line and everything before it as the corrected LaTeX
-    corrected_tex=$(echo "$result" | python3 -c "
+    # Extract corrected LaTeX (before SCORE:) and summary (from SCORE: onward)
+    eval "$(echo "$result" | python3 -c "
 import sys
 text = sys.stdin.read()
-score_idx = text.find('SCORE:')
-if score_idx > 0:
-    print(text[:score_idx].strip())
+idx = text.find('SCORE:')
+if idx > 0:
+    tex = text[:idx].strip()
+    summary = text[idx:]
 else:
-    print(text)
-")
-    summary=$(echo "$result" | python3 -c "
-import sys
-text = sys.stdin.read()
-score_idx = text.find('SCORE:')
-if score_idx >= 0:
-    print(text[score_idx:])
-")
+    tex = text
+    summary = 'SCORE:unknown'
+# Shell-safe output
+tex = tex.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))
+summary = summary.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))
+print(f'_corrected_tex={chr(39)}{tex}{chr(39)}')
+print(f'_summary={chr(39)}{summary}{chr(39)}')
+")"
 
-    if [ -n "$corrected_tex" ] && [ ${#corrected_tex} -gt 100 ]; then
-        echo "$corrected_tex" > "$tex_file"
+    if [ -n "$_corrected_tex" ] && [ ${#_corrected_tex} -gt 100 ]; then
+        printf '%s' "$_corrected_tex" > "$tex_file"
         log "  [qa] main.tex updated with QA fixes"
         if command -v latexmk >/dev/null 2>&1; then
             cd "$OUTPUT_DIR" && latexmk -xelatex -interaction=nonstopmode main.tex >/dev/null 2>&1 || true
@@ -317,28 +383,37 @@ if score_idx >= 0:
         fi
     fi
 
-    score_line=$(echo "$summary" | grep "^SCORE:" | head -1)
+    score_line=$(echo "$_summary" | grep "^SCORE:" | head -1)
     echo "[$(date '+%Y-%m-%d')] QA: $score_line | File: $(basename "$file")" \
         >> "$PROJECT_ROOT/memory/feedback-history.md"
 
     log "  [qa] $score_line"
-    mark_done "$file" "qa" "$score_line"
+    [ "$_skip_mark" != "skip" ] && mark_done "$file" "qa" "$score_line"
+    return 0
 }
 
 # ─── Handler: all ────────────────────────────────────────────────────────
+# Calls each handler with "skip" flag so they don't touch the trigger marker.
+# Only handle_all writes the final done marker.
 handle_all() {
     file="$1"
-    log "  [all] Running full pipeline: memory → compile → check → qa"
+    log "  [all] Running full pipeline: memory -> compile -> check -> qa"
+    pipeline_notes=""
 
-    # Re-mark as processing for each step (the trigger was already replaced)
-    handle_memory "$file"
-    # Re-acquire: handle_memory replaced the trigger line with a done marker.
-    # For subsequent steps, we just call the handlers directly.
-    handle_compile "$file"
-    handle_check "$file"
-    handle_qa "$file"
+    handle_memory "$file" "skip"
+    pipeline_notes="memory:ok"
 
-    log "  [all] Full pipeline complete."
+    handle_compile "$file" "skip"
+    pipeline_notes="$pipeline_notes, compile:ok"
+
+    handle_check "$file" "skip"
+    pipeline_notes="$pipeline_notes, check:ok"
+
+    handle_qa "$file" "skip"
+    pipeline_notes="$pipeline_notes, qa:ok"
+
+    mark_done "$file" "all" "$pipeline_notes"
+    log "  [all] Pipeline complete: $pipeline_notes"
 }
 
 # ─── Main dispatch ────────────────────────────────────────────────────────
@@ -352,12 +427,11 @@ dispatch() {
     trigger=$(find_trigger "$file")
 
     if [ -z "$trigger" ]; then
-        # No trigger: silently update checksums
         python3 "$PREPROCESS" --checksums-only "$file" 2>/dev/null || true
         return
     fi
 
-    log "Trigger '/$trigger' detected in: $1"
+    log "Trigger '/claude:$trigger' detected in: $1"
 
     mark_processing "$file" "$trigger"
 
@@ -386,6 +460,9 @@ main() {
     check_deps
     mkdir -p "$STATE_DIR"
     touch "$LOG_FILE"
+
+    # Clean up any stale "processing..." markers from a previous crash
+    cleanup_stale_markers
 
     log "=== Thesis Watcher started (PID $$) ==="
     log "Watching: $NOTES_DIR"
@@ -419,6 +496,9 @@ main() {
 
         # Small sleep to let the editor finish writing
         sleep 0.3
+
+        # Rotate log if too large
+        rotate_log
 
         dispatch "$fname"
     done
