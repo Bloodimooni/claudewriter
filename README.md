@@ -22,7 +22,7 @@ Frontmatter rules             →   LaTeX packages, spacing, margins
 
 ### Two Ways to Trigger Processing
 
-**Option A — Claude Code slash commands** (interactive, you're already in Claude Code):
+**Option A — Claude Code slash commands**:
 ```
 /thesis-memory       rebuild memory from your notes
 /thesis-compile      generate LaTeX (and PDF if LaTeX is installed)
@@ -31,7 +31,7 @@ Frontmatter rules             →   LaTeX packages, spacing, margins
 /thesis-qa           score quality and auto-improve (loops up to 3×)
 ```
 
-**Option B — Background watcher** (hands-off, stays in your editor):
+**Option B — Background watcher**:
 
 Start the watcher once:
 ```sh
