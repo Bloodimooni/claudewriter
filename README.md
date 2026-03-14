@@ -54,20 +54,18 @@ The watcher detects the save, processes the file, and replaces the trigger with 
 
 ### Requirements
 
-| Tool | Purpose | Install (CachyOS/Arch) |
+| Tool | Purpose | Install |
 |------|---------|----------------------|
 | [Claude Code](https://claude.ai/claude-code) | AI slash commands + watcher AI calls | See below |
 | Python 3 | Zero-token preprocessing | Pre-installed |
-| inotify-tools | File watching | `sudo pacman -S inotify-tools` |
-| TeX Live (optional) | PDF compilation | `sudo pacman -S texlive-full` |
+| inotify-tools | File watching | `sudo pacman -S inotify-tools` (Archlinux) |
+| TeX Live (optional) | PDF compilation | `sudo pacman -S texlive-full` (Archlinux) |
 
 > TeX Live is optional. Without it, the system still generates a `.tex` file. Install it to also get a PDF.
 
 ### Install Claude Code
 
-```sh
-npm install -g @anthropic-ai/claude-code
-```
+https://code.claude.com/docs/en/quickstart
 
 Then authenticate:
 ```sh
@@ -84,7 +82,7 @@ cd claudewriter
 chmod +x scripts/*.sh
 ```
 
-That's it. No `npm install`, no virtual environment, no build step.
+That's it.
 
 ---
 
