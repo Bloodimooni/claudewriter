@@ -1,6 +1,6 @@
 # claudewriter
 
-A thesis writing system built on [Claude Code](https://claude.ai/claude-code). Write informal notes in your editor — Claude converts them into a formal, properly-cited LaTeX thesis.
+A thesis writing system built on [Claude Code](https://code.claude.com/docs/en/how-claude-code-works). Write informal notes in your editor — Claude converts them into a formal, properly-cited LaTeX thesis.
 
 The idea: focus on **learning the material**, not on academic writing conventions. You write what you understand. The system handles formalization, citation formatting, LaTeX structure, fact-checking, plagiarism risk, and quality scoring.
 
