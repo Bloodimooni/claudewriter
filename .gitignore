@@ -1,0 +1,25 @@
+# LaTeX build artifacts
+thesis/output/*.aux
+thesis/output/*.log
+thesis/output/*.toc
+thesis/output/*.out
+thesis/output/*.fls
+thesis/output/*.fdb_latexmk
+thesis/output/*.bbl
+thesis/output/*.bcf
+thesis/output/*.blg
+thesis/output/*.run.xml
+thesis/output/*.synctex.gz
+
+# Keep deliverables in git
+!thesis/output/*.tex
+!thesis/output/*.pdf
+
+# Memory files are personal/local — remove the line below to track them in git
+memory/
+
+# Watcher runtime state
+scripts/.watcher-state/
+
+# Secrets
+.env
