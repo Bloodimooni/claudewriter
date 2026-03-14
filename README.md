@@ -1,6 +1,6 @@
 # claudewriter
 
-A thesis writing system built on [Claude Code](https://claude.ai/claude-code). Write informal notes in your editor — Claude converts them into a formal, properly-cited LaTeX thesis.
+A thesis writing system built on [Claude Code](https://code.claude.com/docs/en/how-claude-code-works). Write informal notes in your editor — Claude converts them into a formal, properly-cited LaTeX thesis.
 
 The idea: focus on **learning the material**, not on academic writing conventions. You write what you understand. The system handles formalization, citation formatting, LaTeX structure, fact-checking, plagiarism risk, and quality scoring.
 
@@ -22,7 +22,7 @@ Frontmatter rules             →   LaTeX packages, spacing, margins
 
 ### Two Ways to Trigger Processing
 
-**Option A — Claude Code slash commands** (interactive, you're already in Claude Code):
+**Option A — Claude Code slash commands**:
 ```
 /thesis-memory       rebuild memory from your notes
 /thesis-compile      generate LaTeX (and PDF if LaTeX is installed)
@@ -31,7 +31,7 @@ Frontmatter rules             →   LaTeX packages, spacing, margins
 /thesis-qa           score quality and auto-improve (loops up to 3×)
 ```
 
-**Option B — Background watcher** (hands-off, stays in your editor):
+**Option B — Background watcher**:
 
 Start the watcher once:
 ```sh
@@ -54,20 +54,18 @@ The watcher detects the save, processes the file, and replaces the trigger with 
 
 ### Requirements
 
-| Tool | Purpose | Install (CachyOS/Arch) |
+| Tool | Purpose | Install |
 |------|---------|----------------------|
 | [Claude Code](https://claude.ai/claude-code) | AI slash commands + watcher AI calls | See below |
 | Python 3 | Zero-token preprocessing | Pre-installed |
-| inotify-tools | File watching | `sudo pacman -S inotify-tools` |
-| TeX Live (optional) | PDF compilation | `sudo pacman -S texlive-full` |
+| inotify-tools | File watching | `sudo pacman -S inotify-tools` (Archlinux) |
+| TeX Live (optional) | PDF compilation | `sudo pacman -S texlive-full` (Archlinux) |
 
 > TeX Live is optional. Without it, the system still generates a `.tex` file. Install it to also get a PDF.
 
 ### Install Claude Code
 
-```sh
-npm install -g @anthropic-ai/claude-code
-```
+https://code.claude.com/docs/en/quickstart
 
 Then authenticate:
 ```sh
@@ -84,7 +82,7 @@ cd claudewriter
 chmod +x scripts/*.sh
 ```
 
-That's it. No `npm install`, no virtual environment, no build step.
+That's it.
 
 ---
 
